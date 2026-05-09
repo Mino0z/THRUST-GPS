@@ -3,3 +3,4 @@ uvicorn
 pandas
 pydantic
 websockets
+gtfs-realtime-bindings

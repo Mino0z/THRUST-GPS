@@ -1,17 +1,23 @@
-import asyncio
-import pandas as pd
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-import json
-import logging
-from typing import Optional
+import os
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Importy naszych funkcji do obsługi GTFS
+from functions.load_and_filter_data import load_and_filter_data
+from functions.get_stops_for_route import get_stops_for_route
+from functions.get_trip_schedule import get_trip_schedule
+from functions.get_active_services import get_active_services
+from functions.parse_realtime_data import parse_realtime_data
 
-app = FastAPI(title="T/H/RUST GPS Live Telemetry API")
+app = FastAPI(
+    title="T:H:RUST GPS API",
+    description="API do obsługi danych GTFS statycznych i czasu rzeczywistego (realtime). Automatycznie wygenerowana dokumentacja Swagger.",
+    version="1.0.0",
+    docs_url="/",
+    redoc_url="/redoc"
+)
 
+# Konfiguracja CORS (pozwala na komunikację z frontendem np. w Vue/React)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,85 +26,72 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class TelemetryData(BaseModel):
-    feature_1: float = Field(default=0.0)
-    feature_2: float = Field(default=0.0)
-    feature_3: float = Field(default=0.0)
-    feature_4: float = Field(default=0.0)
-    feature_5: float = Field(default=0.0)
-    feature_6: float = Field(default=0.0)
-    feature_7: float = Field(default=0.0)
-    feature_8: float = Field(default=0.0)
-    feature_9: float = Field(default=0.0)
-    feature_10: float = Field(default=0.0)
-    feature_11: float = Field(default=0.0)
-    feature_12: float = Field(default=0.0)
-    feature_13: float = Field(default=0.0)
-    trust_index: float = Field(description="Calculated trust index from 0 to 100%")
-    label: str = Field(description="Spoofing label")
+# Ścieżki do plików
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATASET_DIR = os.path.join(BASE_DIR, "datasets")
+REALTIME_FILE = os.path.join(DATASET_DIR, "realtime.pb")
 
-@app.websocket("/api/flight-stream")
-async def flight_stream(websocket: WebSocket):
-    await websocket.accept()
-    logger.info("WebSocket connected")
-    
-    try:
-        try:
-            # Replace with the actual path to your CSV file
-            df = pd.read_csv("gps_data.csv")
-        except FileNotFoundError:
-            # Fallback mock data if file doesn't exist yet
-            logger.warning("gps_data.csv not found, using dummy data.")
-            df = pd.DataFrame([
-                {**{f"feature_{i}": i * 0.1 for i in range(1, 14)}, "label": "authentic"},
-                {**{f"feature_{i}": i * 0.5 for i in range(1, 14)}, "label": "simplistic"},
-                {**{f"feature_{i}": i * 1.0 for i in range(1, 14)}, "label": "sophisticated"}
-            ])
-            
-        for _, row in df.iterrows():
-            label = str(row.get("label", "authentic")).lower()
-            
-            # Trust logic mapping based on label
-            trust_index = 100.0
-            if "simplistic" in label:
-                trust_index = 30.0
-            elif "intermediate" in label:
-                trust_index = 15.0
-            elif "sophisticated" in label:
-                trust_index = 5.0
-            elif "authentic" not in label:
-                trust_index = 0.0
+# Globalny obiekt na dane statyczne, żeby wczytać je tylko raz
+gtfs_data = {}
 
-            # Safe extraction of 13 features
-            features = []
-            for i in range(13):
-                # Adjust column reading if your CSV has named headers like 'f1', 'feature_1' etc.
-                val = row.iloc[i] if i < len(row.index) else 0.0
-                try:
-                    features.append(float(val))
-                except (ValueError, TypeError):
-                    features.append(0.0)
-            
-            data = TelemetryData(
-                feature_1=features[0], feature_2=features[1], feature_3=features[2],
-                feature_4=features[3], feature_5=features[4], feature_6=features[5],
-                feature_7=features[6], feature_8=features[7], feature_9=features[8],
-                feature_10=features[9], feature_11=features[10], feature_12=features[11],
-                feature_13=features[12],
-                trust_index=trust_index,
-                label=row.get("label", "authentic")
-            )
-            
-            await websocket.send_json(data.model_dump())
-            await asyncio.sleep(1) # stream rows 1 by 1 every second
-            
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
-    except Exception as e:
-        logger.error(f"Error streaming data: {e}")
-        await websocket.close()
+@app.on_event("startup")
+def startup_event():
+    """
+    Wywoływane przy starcie serwera - ładuje (filtruje) wszystkie statyczne dane do pamięci RAM.
+    """
+    global gtfs_data
+    print("Wczytywanie statycznych zbiorów danych GTFS...")
+    gtfs_data = load_and_filter_data(DATASET_DIR)
+    print("Zakończono wczytywanie danych GTFS!")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+@app.get("/status")
+def read_status():
+    return {"status": "ok", "message": "API T:H:RUST GPS działa"}
 
+@app.get("/routes")
+def get_routes():
+    """
+    Zwraca wszystkie dostępne trasy.
+    """
+    if "routes" not in gtfs_data or gtfs_data["routes"].empty:
+        return []
+    return gtfs_data["routes"].fillna("").to_dict(orient="records")
+
+@app.get("/route/{route_id}/stops")
+def route_stops(route_id: str):
+    """
+    Zwraca wszystkie stop_id i współrzędne dla wybranej trasy (skrót).
+    """
+    stops_df = get_stops_for_route(gtfs_data, route_id)
+    if stops_df.empty:
+        raise HTTPException(status_code=404, detail="Brak przystanków dla tej trasy.")
+    return stops_df.fillna("").to_dict(orient="records")
+
+@app.get("/trip/{trip_id}/schedule")
+def trip_schedule(trip_id: str):
+    """
+    Zwraca pełen rozkład dla konkretnego przejazdu.
+    """
+    schedule_df = get_trip_schedule(gtfs_data, trip_id)
+    if schedule_df.empty:
+        raise HTTPException(status_code=404, detail="Brak rozkładu dla tego trip_id.")
+    return schedule_df.fillna("").to_dict(orient="records")
+
+@app.get("/services/active")
+def active_services(date: str, day: str):
+    """
+    Zwraca aktywne service_id na konkretny dzień.
+    np. /services/active?date=20260509&day=saturday
+    """
+    services = get_active_services(gtfs_data, date, day)
+    return {"active_services": services}
+
+@app.get("/realtime")
+def realtime_positions():
+    """
+    Parsuje na żywo (co każde zapytanie frontendu) plik .pb i zwraca pozycje GPS. 
+    """
+    rt_df = parse_realtime_data(REALTIME_FILE)
+    if rt_df.empty:
+        return []
+    return rt_df.fillna("").to_dict(orient="records")
